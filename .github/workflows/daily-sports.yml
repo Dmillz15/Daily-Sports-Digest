@@ -17,8 +17,9 @@ jobs:
 
       - run: pip install requests
 
-      - run: python daily_sports.py
+      - run: python daily_sports_oddsapi.py
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
           TIMEZONE: America/New_York
           # LEAGUES: nba,nhl,epl
