@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
 Daily sports aggregator -> Discord webhook.
-
-Setup:
-    pip install requests
-    export DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/XXXX/YYYY"
-    python daily_sports.py
-
+"""
+#Setup:
+pip install requests
+export DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/1565352637094699221/IBcKRjqDOeIlOLanX3ASOMYiy6xTcuM5kxegOpkZDUzy9-fDPPOYCEjdFFdHYOzn4qhA"
+"""
 Optional env vars:
     TIMEZONE   IANA timezone for displayed game times (default: America/New_York)
     LEAGUES    Comma-separated keys from the LEAGUES dict below
