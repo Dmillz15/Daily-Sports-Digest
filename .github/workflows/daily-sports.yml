@@ -20,5 +20,5 @@ jobs:
       - run: python daily_sports.py
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          TIMEZONE: America/Chicago
+          TIMEZONE: America/New York
           # LEAGUES: nba,nhl,epl
