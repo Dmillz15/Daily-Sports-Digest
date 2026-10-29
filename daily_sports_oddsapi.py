@@ -46,6 +46,27 @@ LEAGUES = {
     "ucl":   ("Champions League",    "soccer_uefa_champs_league",      0x0A1C5C),
 }
 
+# ESPN is used ONLY to look up where each game is broadcast (The Odds API has
+# no TV data). Unofficial endpoint; if it fails, games are shown without TV info.
+ESPN_URL = "https://site.api.espn.com/apis/site/v2/sports/{path}/scoreboard"
+ESPN_PATHS = {
+    "nba":   "basketball/nba",
+    "nfl":   "football/nfl",
+    "mlb":   "baseball/mlb",
+    "nhl":   "hockey/nhl",
+    "wnba":  "basketball/wnba",
+    "ncaaf": "football/college-football",
+    "ncaam": "basketball/mens-college-basketball",
+    "epl":   "soccer/eng.1",
+    "mls":   "soccer/usa.1",
+    "ucl":   "soccer/uefa.champions",
+}
+# College scoreboards only return featured games unless a group is requested.
+ESPN_EXTRA_PARAMS = {
+    "ncaaf": {"groups": "80"},
+    "ncaam": {"groups": "50"},
+}
+
 EMBED_DESC_LIMIT = 4000   # Discord hard limit is 4096
 MAX_EMBEDS_PER_MSG = 10   # Discord limit per webhook message
 
@@ -88,8 +109,71 @@ def fetch_scores(api_key: str, sport_key: str) -> dict:
     return {e["id"]: e for e in r.json()}
 
 
-def format_event(event: dict, tz: ZoneInfo, score_event: dict = None) -> str:
+def normalize(name: str) -> str:
+    return "".join(ch for ch in name.lower().replace("&", "and") if ch.isalnum())
+
+
+def get_broadcasts(comp: dict, limit: int = 4) -> str:
+    """Return a short 'where to watch' string, e.g. 'ESPN, Peacock'."""
+    names = []
+    for b in comp.get("broadcasts", []):
+        names.extend(b.get("names", []))
+    for g in comp.get("geoBroadcasts", []):
+        media = g.get("media", {}).get("shortName")
+        if media:
+            names.append(media)
+
+    unique = []
+    for n in names:
+        if n and n not in unique:
+            unique.append(n)
+    return ", ".join(unique[:limit])
+
+
+def fetch_espn_broadcasts(league_key: str, dates: list) -> dict:
+    """Return {(normalized_away, normalized_home): 'ESPN, Peacock'} from ESPN."""
+    path = ESPN_PATHS.get(league_key)
+    if not path:
+        return {}
+
+    lookup = {}
+    for d in dates:
+        params = {"dates": d, "limit": "300", **ESPN_EXTRA_PARAMS.get(league_key, {})}
+        try:
+            r = requests.get(ESPN_URL.format(path=path), params=params, timeout=15)
+            r.raise_for_status()
+            espn_events = r.json().get("events", [])
+        except (requests.RequestException, ValueError):
+            continue  # TV info is a bonus; never fail the whole post over it
+
+        for ev in espn_events:
+            try:
+                comp = ev["competitions"][0]
+                teams = {c["homeAway"]: c["team"].get("displayName", "") for c in comp["competitors"]}
+                tv = get_broadcasts(comp)
+                away, home = normalize(teams.get("away", "")), normalize(teams.get("home", ""))
+                if tv and away and home:
+                    lookup[(away, home)] = tv
+            except (KeyError, IndexError):
+                continue
+    return lookup
+
+
+def find_broadcast(lookup: dict, away_team: str, home_team: str) -> str:
+    """Match an Odds API game to ESPN data by team name."""
+    a, h = normalize(away_team), normalize(home_team)
+    if (a, h) in lookup:
+        return lookup[(a, h)]
+    # Fallback for naming differences (e.g. "Brighton and Hove Albion" vs "Brighton")
+    for (la, lh), tv in lookup.items():
+        if (la in a or a in la) and (lh in h or h in lh):
+            return tv
+    return ""
+
+
+def format_event(event: dict, tz: ZoneInfo, score_event: dict = None, tv: str = "") -> str:
     away, home = event["away_team"], event["home_team"]
+    tv_suffix = f" — 📺 {tv}" if tv else ""
     start = datetime.fromisoformat(event["commence_time"].replace("Z", "+00:00")).astimezone(tz)
     when = start.strftime("%I:%M %p %Z").lstrip("0")
 
@@ -99,9 +183,9 @@ def format_event(event: dict, tz: ZoneInfo, score_event: dict = None) -> str:
         score = f"{by_team.get(away, '0')}–{by_team.get(home, '0')}"
         if score_event.get("completed"):
             return f"✅ {away} @ {home} — **{score}** (Final)"
-        return f"🔴 {away} @ {home} — **{score}** (Live)"
+        return f"🔴 {away} @ {home} — **{score}** (Live){tv_suffix}"
 
-    return f"🕒 **{when}** — {away} @ {home}"
+    return f"🕒 **{when}** — {away} @ {home}{tv_suffix}"
 
 
 def build_embeds(name: str, color: int, lines: list, date_label: str) -> list:
@@ -144,6 +228,7 @@ def main() -> int:
 
     tz = ZoneInfo(os.environ.get("TIMEZONE", "America/New_York"))
     show_scores = os.environ.get("SHOW_SCORES") == "1"
+    show_tv = os.environ.get("SHOW_TV", "1") != "0"  # set SHOW_TV=0 to turn off
     selected = os.environ.get("LEAGUES")
     keys = [k.strip().lower() for k in selected.split(",")] if selected else list(LEAGUES)
 
@@ -151,6 +236,8 @@ def main() -> int:
     day_start = datetime.combine(now.date(), time.min, tzinfo=tz)
     day_end = day_start + timedelta(days=1) - timedelta(seconds=1)
     date_label = now.strftime("%a, %b %d")
+    # ESPN buckets games by US date, so check tomorrow too for late games
+    espn_dates = [now.strftime("%Y%m%d"), (now + timedelta(days=1)).strftime("%Y%m%d")]
 
     try:
         active = get_active_sport_keys(api_key)
@@ -177,7 +264,14 @@ def main() -> int:
             continue
 
         events.sort(key=lambda e: e["commence_time"])
-        lines = [format_event(e, tz, scores.get(e["id"])) for e in events]
+        tv_lookup = fetch_espn_broadcasts(key, espn_dates) if show_tv else {}
+        lines = [
+            format_event(
+                e, tz, scores.get(e["id"]),
+                find_broadcast(tv_lookup, e["away_team"], e["home_team"]),
+            )
+            for e in events
+        ]
         embeds.extend(build_embeds(name, color, lines, date_label))
 
     if not embeds:
