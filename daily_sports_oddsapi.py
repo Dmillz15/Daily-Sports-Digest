@@ -20,16 +20,21 @@ Optional env vars:
     BOOKMAKER     Preferred sportsbook key (default: draftkings). If it has no
                   line for a game, the first book that does is used.
     SHOW_TV       Set to 0 to drop the WATCH column (default: on).
-    SHORT_NAMES   Set to 0 to use full team names (default: on).
+    SHORT_NAMES   Set to 0 to use full-length team names and times when they
+                  fit within TABLE_WIDTH (default: on = always compact).
     SHOW_SCORES   Set to 1 to also fetch live scores (1 credit per league per run).
     ANSI          Set to 1 for COLORED tables (colored/bold headings, green lines,
                   red LIVE tags). Discord shows colors on desktop and web only;
                   on mobile it can look plain or garbled, so it is off by default.
-    TABLE_WIDTH   Max characters per table line (default: 52). Discord wraps
-                  longer lines onto a second line. The script automatically
-                  compacts each table to fit: shorter times (7:10p), then team
-                  abbreviations (CBJ @ CAR), then drops the O/U column. Lower
-                  this (for example 40) if tables wrap on phones.
+    TABLE_WIDTH   Max characters per table line (default: 40, sized for phones).
+                  Discord wraps longer lines onto a second line. Tables are
+                  always compact (short times like 7:10p, team abbreviations like
+                  CBJ @ CAR). If a table is still too wide it tightens the column
+                  spacing, then drops the O/U column, then truncates GAME. If
+                  tables wrap on your phone, lower it (for example 36).
+    GRID          Table line style: "ascii" (default, | - +, renders the same on
+                  every device) or "box" (prettier box-drawing characters, which
+                  some phones draw unevenly).
     BIG_HEADERS   Large markdown headers for the post title and each league
                   (default: on). Set to 0 to use plain embed titles instead.
 
@@ -333,9 +338,13 @@ def team_display(name: str, league_key: str, teams: dict, use_short: bool) -> st
 
 
 def team_abbr(name: str, teams: dict, fallback: str) -> str:
-    """Name shown in the LINE column (abbreviation keeps it narrow)."""
+    """Abbreviation for the LINE column and compact GAME column."""
     info = find_team(teams, name)
-    return (info or {}).get("abbr") or fallback
+    abbr = (info or {}).get("abbr")
+    if abbr:
+        return abbr
+    # No ESPN match: keep short names as-is, otherwise use the first 3 letters
+    return fallback if len(fallback) <= 5 else fallback.replace(" ", "")[:3].upper()
 
 
 def pick_outcomes(odds_event, market_key: str, preferred: str):
@@ -422,12 +431,19 @@ def _style(text: str, code, ansi: bool) -> str:
     return f"\u001b[{code}m{text}\u001b[0m" if (ansi and code) else text
 
 
-def _plan_table(rows: list, show_watch: bool, max_width: int) -> tuple:
+GRIDS = {
+    "ascii": ("|", "-", "+"),
+    "box":   ("│", "─", "┼"),
+}
+
+
+def _plan_table(rows: list, show_watch: bool, max_width: int, prefer_compact: bool) -> tuple:
     """Pick the roomiest layout whose widest line fits in max_width characters.
 
-    Discord wraps long lines inside a code block, which wrecks the table, so
-    we compact step by step: shorter times, then abbreviations, then drop O/U,
-    and finally truncate the GAME column.
+    Discord wraps long lines inside a code block, which wrecks the table. By
+    default every table is compact (short times + abbreviations) so all leagues
+    look the same. If it is still too wide: tighten the column spacing, then
+    drop O/U, then truncate the GAME column.
     """
     def columns_for(drop_total: bool) -> list:
         cols = [("TIME", "time"), ("GAME", "game")]
@@ -450,14 +466,17 @@ def _plan_table(rows: list, show_watch: bool, max_width: int) -> tuple:
             v = r[key]
         return v or ("-" if key not in ("time", "game") else "")
 
-    # (short_time, abbreviations, drop_total)
-    attempts = [(False, False, False), (True, False, False), (True, True, False), (True, True, True)]
-    for short_time, abbr, drop_total in attempts:
+    # (short_time, abbreviations, padding around column bars, drop_total)
+    compact = [(True, True, 1, False), (True, True, 0, False), (True, True, 0, True)]
+    full = [(False, False, 1, False), (True, False, 1, False)]
+    attempts = compact if prefer_compact else full + compact
+
+    for short_time, abbr, pad, drop_total in attempts:
         cols = columns_for(drop_total)
         headers = [h for h, _ in cols]
         table = [[value(r, k, short_time, abbr) for _, k in cols] for r in rows]
         widths = [max(len(h), *(len(row[i]) for row in table)) for i, h in enumerate(headers)]
-        width = sum(widths) + 3 * (len(widths) - 1)
+        width = sum(widths) + (2 * pad + 1) * (len(widths) - 1)
         if width <= max_width:
             break
     else:
@@ -468,35 +487,37 @@ def _plan_table(rows: list, show_watch: bool, max_width: int) -> tuple:
                 row[1] = row[1][:room - 1] + "…"
         widths[1] = max(len(headers[1]), *(len(row[1]) for row in table))
 
-    return [k for _, k in cols], headers, table, widths
+    return [k for _, k in cols], headers, table, widths, pad
 
 
 def build_table_embeds(title: str, color: int, rows: list, show_watch: bool = True,
                        ansi: bool = False, big_headers: bool = True,
-                       max_width: int = 52) -> list:
+                       max_width: int = 40, prefer_compact: bool = True,
+                       grid: str = "ascii") -> list:
     """Render rows as a grid table inside a code block.
 
     Discord doesn't render Markdown tables, and font size can't change inside a
-    code block, so the league title gets a big markdown header above the table
-    and the table itself uses box-drawing grid lines (and optional ANSI colors).
-    The layout is auto-compacted so no line exceeds max_width characters (which
-    would wrap). Columns with no data are left out. Splits into extra embeds if
-    it would exceed Discord's size limit.
+    code block, so the league title gets a big markdown header above the table.
+    The layout is auto-fit so no line exceeds max_width characters (which would
+    wrap). Columns with no data are left out. Splits into extra embeds if it
+    would exceed Discord's size limit.
     """
-    keys, headers, table, widths = _plan_table(rows, show_watch, max_width)
+    keys, headers, table, widths, pad = _plan_table(rows, show_watch, max_width, prefer_compact)
     n = len(keys)
+    vbar, hbar, cross = GRIDS.get(grid, GRIDS["ascii"])
+    sp = " " * pad
 
     def cell(i: int, text: str, code) -> str:
         body = text.ljust(widths[i]) if i < n - 1 else text   # last column unpadded
         if i == 0:
-            shown = body + " "
+            shown = body + sp
         elif i == n - 1:
-            shown = " " + body
+            shown = sp + body
         else:
-            shown = " " + body + " "
+            shown = sp + body + sp
         return _style(shown, code, ansi)
 
-    sep = _style("│", SEP_STYLE, ansi)
+    sep = _style(vbar, SEP_STYLE, ansi)
 
     def render(cells: list, is_head: bool = False) -> str:
         out = []
@@ -512,7 +533,7 @@ def build_table_embeds(title: str, color: int, rows: list, show_watch: bool = Tr
 
     head = render(headers, is_head=True)
     divider = _style(
-        "┼".join("─" * (w + (1 if i in (0, n - 1) else 2)) for i, w in enumerate(widths)),
+        cross.join(hbar * (w + (pad if i in (0, n - 1) else 2 * pad)) for i, w in enumerate(widths)),
         SEP_STYLE, ansi,
     )
     lines = [render(r) for r in table]
@@ -597,9 +618,10 @@ def main() -> int:
     ansi = os.environ.get("ANSI") == "1"
     big_headers = os.environ.get("BIG_HEADERS", "1") != "0"
     try:
-        max_width = int(os.environ.get("TABLE_WIDTH", "52"))
+        max_width = int(os.environ.get("TABLE_WIDTH", "40"))
     except ValueError:
-        max_width = 52
+        max_width = 40
+    grid = os.environ.get("GRID", "ascii").strip().lower()
     book = os.environ.get("BOOKMAKER", "draftkings").strip().lower()
     selected = os.environ.get("LEAGUES")
     keys = [k.strip().lower() for k in selected.split(",")] if selected else list(LEAGUES)
@@ -667,6 +689,7 @@ def main() -> int:
         embeds.extend(build_table_embeds(
             f"{icon} {name}", color, rows,
             show_watch=show_tv, ansi=ansi, big_headers=big_headers, max_width=max_width,
+            prefer_compact=use_short, grid=grid,
         ))
 
     if not embeds:
