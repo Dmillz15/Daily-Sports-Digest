@@ -1,4 +1,3 @@
-# Daily-Sports-Digest
 # 🏟️ Daily Sports Digest for Discord
 
 A small Python script that posts **today's games** to a Discord channel every day: start times, betting lines, and where to watch, organized by league in clean tables. It runs for free on GitHub Actions, so nothing has to stay running on your computer.
