@@ -22,6 +22,11 @@ Optional env vars:
     SHOW_TV       Set to 0 to drop the WATCH column (default: on).
     SHORT_NAMES   Set to 0 to use full team names (default: on).
     SHOW_SCORES   Set to 1 to also fetch live scores (1 credit per league per run).
+    ANSI          Set to 1 for COLORED tables (colored/bold headings, green lines,
+                  red LIVE tags). Discord shows colors on desktop and web only;
+                  on mobile it can look plain or garbled, so it is off by default.
+    BIG_HEADERS   Large markdown headers for the post title and each league
+                  (default: on). Set to 0 to use plain embed titles instead.
 
 Odds API credit cost per run (free plan = 500 credits/month):
     - Schedule (events) and sports list: free.
@@ -40,6 +45,7 @@ Notes:
 
 import os
 import sys
+import time as time_module
 import unicodedata
 from datetime import datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -99,6 +105,7 @@ ESPN_EXTRA_PARAMS = {
 
 EMBED_DESC_LIMIT = 4000   # Discord hard limit is 4096
 MAX_EMBEDS_PER_MSG = 10   # Discord limit per webhook message
+MAX_EMBED_CHARS_PER_MSG = 5800  # Discord caps total embed text per message at 6000
 
 USAGE = {}  # filled from Odds API response headers
 
@@ -361,12 +368,26 @@ def make_row(event: dict, tz: ZoneInfo, score_event, away_d: str, home_d: str,
     return row
 
 
-def build_table_embeds(title: str, color: int, rows: list, show_watch: bool = True) -> list:
-    """Render rows as an aligned monospace table inside a code block.
+# ANSI styles (only used when ANSI=1). Discord renders these on desktop/web.
+HEAD_STYLE = "1;33"          # bold yellow column headings
+SEP_STYLE = "30"             # gray grid lines
+LIVE_STYLE = "1;31"          # bold red
+COLUMN_STYLE = {"time": "36", "score": "1", "line": "32", "total": "35"}
 
-    Discord doesn't render Markdown tables, so a code block is the way to get
-    aligned columns. Columns with no data are left out. Splits into extra
-    embeds if it would exceed Discord's limit.
+
+def _style(text: str, code, ansi: bool) -> str:
+    return f"\u001b[{code}m{text}\u001b[0m" if (ansi and code) else text
+
+
+def build_table_embeds(title: str, color: int, rows: list, show_watch: bool = True,
+                       ansi: bool = False, big_headers: bool = True) -> list:
+    """Render rows as a grid table inside a code block.
+
+    Discord doesn't render Markdown tables, and font size can't change inside a
+    code block, so the league title gets a big markdown header above the table
+    and the table itself uses box-drawing grid lines (and optional ANSI colors).
+    Columns with no data are left out. Splits into extra embeds if it would
+    exceed Discord's size limit.
     """
     columns = [("TIME", "time"), ("GAME", "game")]
     if any(r["score"] for r in rows):
@@ -379,17 +400,45 @@ def build_table_embeds(title: str, color: int, rows: list, show_watch: bool = Tr
         columns.append(("WATCH", "watch"))
 
     headers = [h for h, _ in columns]
-    table = [[(r[k] or ("-" if k not in ("time", "game") else "")) for _, k in columns] for r in rows]
+    keys = [k for _, k in columns]
+    n = len(columns)
+    table = [[(r[k] or ("-" if k not in ("time", "game") else "")) for k in keys] for r in rows]
     widths = [max(len(h), *(len(r[i]) for r in table)) for i, h in enumerate(headers)]
 
-    def fmt(cells):
-        return "  ".join(c.ljust(w) for c, w in zip(cells, widths)).rstrip()
+    def cell(i: int, text: str, code) -> str:
+        body = text.ljust(widths[i]) if i < n - 1 else text   # last column unpadded
+        if i == 0:
+            shown = body + " "
+        elif i == n - 1:
+            shown = " " + body
+        else:
+            shown = " " + body + " "
+        return _style(shown, code, ansi)
 
-    head = fmt(headers)
-    divider = "  ".join("-" * w for w in widths)
-    lines = [fmt(r) for r in table]
+    sep = _style("│", SEP_STYLE, ansi)
 
-    overhead = len("```\n") + len(head) + 1 + len(divider) + 1 + len("```")
+    def render(cells: list, is_head: bool = False) -> str:
+        out = []
+        for i, (text, key) in enumerate(zip(cells, keys)):
+            if is_head:
+                code = HEAD_STYLE
+            elif key == "time" and text == "LIVE":
+                code = LIVE_STYLE
+            else:
+                code = COLUMN_STYLE.get(key)
+            out.append(cell(i, text, code))
+        return sep.join(out)
+
+    head = render(headers, is_head=True)
+    divider = _style(
+        "┼".join("─" * (w + (1 if i in (0, n - 1) else 2)) for i, w in enumerate(widths)),
+        SEP_STYLE, ansi,
+    )
+    lines = [render(r) for r in table]
+
+    lang = "ansi" if ansi else ""
+    header_room = len(f"## {title} (cont.)") + 1 if big_headers else 0
+    overhead = header_room + len(f"```{lang}\n") + len(head) + 1 + len(divider) + 1 + len("```")
     chunks, current, size = [], [], overhead
     for line in lines:
         if current and size + len(line) + 1 > EMBED_DESC_LIMIT:
@@ -400,14 +449,38 @@ def build_table_embeds(title: str, color: int, rows: list, show_watch: bool = Tr
     if current:
         chunks.append(current)
 
-    return [
-        {
-            "title": title + (" (cont.)" if i else ""),
-            "description": "```\n" + head + "\n" + divider + "\n" + "\n".join(chunk) + "\n```",
-            "color": color,
-        }
-        for i, chunk in enumerate(chunks)
-    ]
+    embeds = []
+    for i, chunk in enumerate(chunks):
+        name = title + (" (cont.)" if i else "")
+        body = f"```{lang}\n{head}\n{divider}\n" + "\n".join(chunk) + "\n```"
+        embed = {"color": color}
+        if big_headers:
+            embed["description"] = f"## {name}\n{body}"
+        else:
+            embed["title"] = name
+            embed["description"] = body
+        embeds.append(embed)
+    return embeds
+
+
+def embed_size(embed: dict) -> int:
+    return (len(embed.get("title", "")) + len(embed.get("description", ""))
+            + len((embed.get("footer") or {}).get("text", "")))
+
+
+def batch_embeds(embeds: list) -> list:
+    """Group embeds so each message stays under Discord's count and total-size limits."""
+    batches, current, size = [], [], 0
+    for e in embeds:
+        s = embed_size(e)
+        if current and (len(current) >= MAX_EMBEDS_PER_MSG or size + s > MAX_EMBED_CHARS_PER_MSG):
+            batches.append(current)
+            current, size = [], 0
+        current.append(e)
+        size += s
+    if current:
+        batches.append(current)
+    return batches
 
 
 def post_to_discord(webhook_url: str, content: str, embeds: list) -> None:
@@ -415,10 +488,12 @@ def post_to_discord(webhook_url: str, content: str, embeds: list) -> None:
         r = requests.post(webhook_url, json={"content": content}, timeout=15)
         r.raise_for_status()
         return
-    for i in range(0, len(embeds), MAX_EMBEDS_PER_MSG):
-        payload = {"embeds": embeds[i:i + MAX_EMBEDS_PER_MSG]}
+    for i, batch in enumerate(batch_embeds(embeds)):
+        payload = {"embeds": batch}
         if i == 0:
             payload["content"] = content
+        else:
+            time_module.sleep(1)  # stay well inside webhook rate limits
         r = requests.post(webhook_url, json=payload, timeout=15)
         r.raise_for_status()
 
@@ -438,6 +513,8 @@ def main() -> int:
     show_lines = os.environ.get("SHOW_LINES", "1") != "0"
     show_totals = show_lines and os.environ.get("SHOW_TOTALS") == "1"
     use_short = os.environ.get("SHORT_NAMES", "1") != "0"
+    ansi = os.environ.get("ANSI") == "1"
+    big_headers = os.environ.get("BIG_HEADERS", "1") != "0"
     book = os.environ.get("BOOKMAKER", "draftkings").strip().lower()
     selected = os.environ.get("LEAGUES")
     keys = [k.strip().lower() for k in selected.split(",")] if selected else list(LEAGUES)
@@ -501,7 +578,10 @@ def main() -> int:
             rows.append(make_row(e, tz, scores.get(e["id"]), away_d, home_d, line, total, tv))
 
         any_lines = any_lines or any(r["line"] or r["total"] for r in rows)
-        embeds.extend(build_table_embeds(f"{icon} {name}", color, rows, show_watch=show_tv))
+        embeds.extend(build_table_embeds(
+            f"{icon} {name}", color, rows,
+            show_watch=show_tv, ansi=ansi, big_headers=big_headers,
+        ))
 
     if not embeds:
         post_to_discord(webhook_url, f"No games found for {date_label}.", [])
@@ -510,7 +590,10 @@ def main() -> int:
     if any_lines:
         embeds[-1]["footer"] = {"text": "Lines from The Odds API · they move, so check your book"}
 
-    header = f"**Today's games** · {date_label} · times in {now.strftime('%Z')}"
+    if big_headers:
+        header = f"# 🏟️ Today's Games\n-# {date_label} · times in {now.strftime('%Z')}"
+    else:
+        header = f"**Today's games** · {date_label} · times in {now.strftime('%Z')}"
     post_to_discord(webhook_url, header, embeds)
     print(f"Posted {len(embeds)} embed(s).")
     if USAGE:
