@@ -13,21 +13,34 @@ Optional env vars:
                   (default: America/New_York)
     LEAGUES       Comma-separated keys from the LEAGUES dict below
                   (default: all of them). Example: LEAGUES=nba,nhl,epl
-    SHOW_SCORES   Set to 1 to also fetch live scores (1 credit per league per run).
+    SHOW_LINES    Set to 0 to drop the betting LINE column (default: on).
+                  NBA/NFL/WNBA/college show the point spread; MLB/NHL/soccer
+                  show the moneyline favorite.
+    SHOW_TOTALS   Set to 1 to add an O/U (over/under) column (default: off).
+    BOOKMAKER     Preferred sportsbook key (default: draftkings). If it has no
+                  line for a game, the first book that does is used.
     SHOW_TV       Set to 0 to drop the WATCH column (default: on).
-    SHORT_NAMES   Set to 0 to use full team names for NBA/NFL/MLB/NHL/WNBA
-                  instead of just the nickname (default: on).
+    SHORT_NAMES   Set to 0 to use full team names (default: on).
+    SHOW_SCORES   Set to 1 to also fetch live scores (1 credit per league per run).
+
+Odds API credit cost per run (free plan = 500 credits/month):
+    - Schedule (events) and sports list: free.
+    - Lines: 1 credit per in-season league that has games today.
+    - Totals: +1 credit per league. Scores: +1 credit per league.
+    The script prints your remaining credits to the log after each run.
 
 Notes:
-    - The events and sports endpoints do not count against your Odds API quota.
     - Leagues that are out of season are skipped automatically.
-    - The WATCH column shows ONE network per game (the national broadcaster when
-      there is one). It comes from ESPN's unofficial scoreboard; if that fails,
-      the column just shows "-".
+    - Short team names, abbreviations, and TV info come from ESPN's unofficial
+      scoreboard. If that lookup fails or a team can't be matched, the game
+      falls back to the full name / no network, and the post still goes out.
+    - The WATCH column shows ONE network per game (the national broadcaster
+      when there is one).
 """
 
 import os
 import sys
+import unicodedata
 from datetime import datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -49,14 +62,23 @@ LEAGUES = {
     "ucl":   ("Champions League",    "soccer_uefa_champs_league", 0x0A1C5C, "⚽"),
 }
 
-# Leagues where "Los Angeles Lakers" can safely be shortened to "Lakers"
+# Which betting market is shown in the LINE column for each league.
+#   spreads = point spread (favorite and how many points)
+#   h2h     = moneyline (favorite and price)
+LINE_MARKET = {
+    "nba": "spreads", "nfl": "spreads", "wnba": "spreads",
+    "ncaaf": "spreads", "ncaam": "spreads",
+    "mlb": "h2h", "nhl": "h2h", "epl": "h2h", "mls": "h2h", "ucl": "h2h",
+}
+
+# Fallback only (used when ESPN has no short name): "Los Angeles Lakers" -> "Lakers"
 SHORT_NAME_LEAGUES = {"nba", "nfl", "mlb", "nhl", "wnba"}
 TWO_WORD_NICKNAMES = (
     "Trail Blazers", "Red Sox", "White Sox", "Blue Jays", "Blue Jackets",
     "Maple Leafs", "Golden Knights", "Red Wings", "Hockey Club",
 )
 
-# ESPN is used ONLY to look up where each game is broadcast.
+# ESPN is used ONLY for short names, abbreviations, and where to watch.
 ESPN_URL = "https://site.api.espn.com/apis/site/v2/sports/{path}/scoreboard"
 ESPN_PATHS = {
     "nba":   "basketball/nba",
@@ -78,11 +100,19 @@ ESPN_EXTRA_PARAMS = {
 EMBED_DESC_LIMIT = 4000   # Discord hard limit is 4096
 MAX_EMBEDS_PER_MSG = 10   # Discord limit per webhook message
 
+USAGE = {}  # filled from Odds API response headers
+
 
 # ---------------------------------------------------------------- Odds API --
 
 def iso_utc(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _track_usage(resp: requests.Response) -> None:
+    for header, key in (("x-requests-remaining", "remaining"), ("x-requests-last", "last")):
+        if header in resp.headers:
+            USAGE[key] = resp.headers[header]
 
 
 def get_active_sport_keys(api_key: str) -> set:
@@ -115,14 +145,43 @@ def fetch_scores(api_key: str, sport_key: str) -> dict:
         params={"apiKey": api_key, "dateFormat": "iso"},
         timeout=15,
     )
+    _track_usage(r)
     r.raise_for_status()
     return {e["id"]: e for e in r.json()}
 
 
-# ------------------------------------------------------- ESPN TV lookup ----
+def fetch_odds(api_key: str, sport_key: str, markets: list) -> dict:
+    """Costs 1 credit per market (US region). Returns {event_id: odds_event}."""
+    def call(mkts):
+        r = requests.get(
+            f"{API}/sports/{sport_key}/odds",
+            params={
+                "apiKey": api_key,
+                "regions": "us",
+                "markets": ",".join(mkts),
+                "oddsFormat": "american",
+                "dateFormat": "iso",
+            },
+            timeout=20,
+        )
+        _track_usage(r)
+        r.raise_for_status()
+        return {e["id"]: e for e in r.json()}
+
+    try:
+        return call(markets)
+    except requests.HTTPError:
+        # e.g. a sport that doesn't offer totals: retry with just the main line
+        if len(markets) > 1:
+            return call(markets[:1])
+        raise
+
+
+# ------------------------------------------------------- ESPN lookups ------
 
 def normalize(name: str) -> str:
-    return "".join(ch for ch in name.lower().replace("&", "and") if ch.isalnum())
+    name = unicodedata.normalize("NFKD", name.lower().replace("&", "and"))
+    return "".join(ch for ch in name if ch.isalnum())
 
 
 def _market_type(market) -> str:
@@ -136,8 +195,7 @@ def get_main_broadcast(comp: dict) -> str:
     broadcasts = comp.get("broadcasts") or []
     geo = comp.get("geoBroadcasts") or []
 
-    # 1) National broadcasts first
-    for b in broadcasts:
+    for b in broadcasts:  # national first
         if _market_type(b.get("market")) == "national" and b.get("names"):
             return b["names"][0]
     for g in geo:
@@ -145,8 +203,7 @@ def get_main_broadcast(comp: dict) -> str:
         if name and _market_type(g.get("market")) == "national":
             return name
 
-    # 2) Otherwise whatever is listed first
-    for b in broadcasts:
+    for b in broadcasts:  # otherwise whatever is listed first
         if b.get("names"):
             return b["names"][0]
     for g in geo:
@@ -156,13 +213,13 @@ def get_main_broadcast(comp: dict) -> str:
     return ""
 
 
-def fetch_espn_broadcasts(league_key: str, dates: list) -> dict:
-    """Return {(normalized_away, normalized_home): 'ESPN'} from ESPN."""
+def fetch_espn_info(league_key: str, dates: list) -> dict:
+    """Return {"games": {(away, home): 'ESPN'}, "teams": {name: {"short", "abbr"}}}."""
+    info = {"games": {}, "teams": {}}
     path = ESPN_PATHS.get(league_key)
     if not path:
-        return {}
+        return info
 
-    lookup = {}
     for d in dates:
         params = {"dates": d, "limit": "300", **ESPN_EXTRA_PARAMS.get(league_key, {})}
         try:
@@ -170,27 +227,44 @@ def fetch_espn_broadcasts(league_key: str, dates: list) -> dict:
             r.raise_for_status()
             espn_events = r.json().get("events", [])
         except (requests.RequestException, ValueError):
-            continue  # TV info is a bonus; never fail the whole post over it
+            continue  # ESPN data is a bonus; never fail the whole post over it
 
         for ev in espn_events:
             try:
                 comp = ev["competitions"][0]
-                teams = {c["homeAway"]: c["team"].get("displayName", "") for c in comp["competitors"]}
+                names = {}
+                for c in comp["competitors"]:
+                    team = c.get("team") or {}
+                    display = team.get("displayName", "")
+                    if display:
+                        info["teams"][normalize(display)] = {
+                            "short": team.get("shortDisplayName") or "",
+                            "abbr": team.get("abbreviation") or "",
+                        }
+                    names[c.get("homeAway")] = normalize(display)
                 tv = get_main_broadcast(comp)
-                away, home = normalize(teams.get("away", "")), normalize(teams.get("home", ""))
-                if tv and away and home:
-                    lookup[(away, home)] = tv
-            except (KeyError, IndexError):
+                if tv and names.get("away") and names.get("home"):
+                    info["games"][(names["away"], names["home"])] = tv
+            except (KeyError, IndexError, TypeError):
                 continue
-    return lookup
+    return info
 
 
-def find_broadcast(lookup: dict, away_team: str, home_team: str) -> str:
-    """Match an Odds API game to ESPN data by team name."""
+def find_team(teams: dict, name: str):
+    n = normalize(name)
+    if n in teams:
+        return teams[n]
+    for k, v in teams.items():  # fallback for naming differences
+        if k and n and (k in n or n in k):
+            return v
+    return None
+
+
+def find_broadcast(games: dict, away_team: str, home_team: str) -> str:
     a, h = normalize(away_team), normalize(home_team)
-    if (a, h) in lookup:
-        return lookup[(a, h)]
-    for (la, lh), tv in lookup.items():  # fallback for naming differences
+    if (a, h) in games:
+        return games[(a, h)]
+    for (la, lh), tv in games.items():
         if (la in a or a in la) and (lh in h or h in lh):
             return tv
     return ""
@@ -206,47 +280,106 @@ def short_name(name: str) -> str:
     return name.split()[-1]
 
 
-def make_row(event: dict, tz: ZoneInfo, score_event: dict = None,
-             tv: str = "", short: bool = False) -> tuple:
-    """Return (time, game, score, watch) for one table row."""
-    full_away, full_home = event["away_team"], event["home_team"]
-    if short:
-        away, home = short_name(full_away), short_name(full_home)
-    else:
-        away, home = full_away, full_home
-    game = f"{away} @ {home}"
+def team_display(name: str, league_key: str, teams: dict, use_short: bool) -> str:
+    """Name shown in the GAME column."""
+    if not use_short:
+        return name
+    info = find_team(teams, name)
+    if info and info.get("short"):
+        return info["short"]            # e.g. "Ohio State", "Man United"
+    if league_key in SHORT_NAME_LEAGUES:
+        return short_name(name)          # fallback: nickname only
+    return name
+
+
+def team_abbr(name: str, teams: dict, fallback: str) -> str:
+    """Name shown in the LINE column (abbreviation keeps it narrow)."""
+    info = find_team(teams, name)
+    return (info or {}).get("abbr") or fallback
+
+
+def pick_outcomes(odds_event, market_key: str, preferred: str):
+    """Outcomes for a market, from the preferred book if it has one."""
+    if not odds_event:
+        return None
+    books = sorted(odds_event.get("bookmakers", []), key=lambda b: b.get("key") != preferred)
+    for b in books:
+        for m in b.get("markets", []):
+            if m.get("key") == market_key and m.get("outcomes"):
+                return m["outcomes"]
+    return None
+
+
+def get_lines(odds_event, market: str, labels: dict, preferred: str, want_totals: bool) -> tuple:
+    """Return (line, total) strings, e.g. ('BOS -5.5', '221.5')."""
+    line = total = ""
+
+    outcomes = pick_outcomes(odds_event, market, preferred)
+    if outcomes:
+        teams = [o for o in outcomes if o.get("name") in labels]  # skips "Draw"
+        if market == "spreads":
+            teams = [o for o in teams if o.get("point") is not None]
+            if teams:
+                fav = min(teams, key=lambda o: o["point"])  # most negative = favorite
+                line = "PK" if fav["point"] == 0 else f"{labels[fav['name']]} {fav['point']:+g}"
+        elif market == "h2h":
+            teams = [o for o in teams if o.get("price") is not None]
+            if teams:
+                fav = min(teams, key=lambda o: o["price"])  # lowest American price = favorite
+                line = f"{labels[fav['name']]} {int(fav['price']):+d}"
+
+    if want_totals:
+        outs = pick_outcomes(odds_event, "totals", preferred)
+        if outs:
+            over = next(
+                (o for o in outs if str(o.get("name")).lower() == "over" and o.get("point") is not None),
+                None,
+            )
+            if over:
+                total = f"{over['point']:g}"
+
+    return line, total
+
+
+def make_row(event: dict, tz: ZoneInfo, score_event, away_d: str, home_d: str,
+             line: str = "", total: str = "", tv: str = "") -> dict:
+    game = f"{away_d} @ {home_d}"
+    row = {"time": "", "game": game, "score": "", "line": "", "total": "", "watch": ""}
 
     scores = (score_event or {}).get("scores")
     if scores:
         by_team = {s["name"]: s["score"] for s in scores}
-        score = f"{by_team.get(full_away, '0')}–{by_team.get(full_home, '0')}"
+        row["score"] = f"{by_team.get(event['away_team'], '0')}–{by_team.get(event['home_team'], '0')}"
         if score_event.get("completed"):
-            return ("FINAL", game, score, "")
-        return ("LIVE", game, score, tv)
+            row["time"] = "FINAL"
+        else:
+            row["time"], row["watch"] = "LIVE", tv
+        return row
 
     start = datetime.fromisoformat(event["commence_time"].replace("Z", "+00:00")).astimezone(tz)
-    when = start.strftime("%I:%M %p").lstrip("0")
-    return (when, game, "", tv)
+    row.update(time=start.strftime("%I:%M %p").lstrip("0"), line=line, total=total, watch=tv)
+    return row
 
 
 def build_table_embeds(title: str, color: int, rows: list, show_watch: bool = True) -> list:
     """Render rows as an aligned monospace table inside a code block.
 
     Discord doesn't render Markdown tables, so a code block is the way to get
-    aligned columns. Splits into extra embeds if it would exceed Discord's limit.
+    aligned columns. Columns with no data are left out. Splits into extra
+    embeds if it would exceed Discord's limit.
     """
-    show_score = any(r[2] for r in rows)
-    headers = ["TIME", "GAME"] + (["SCORE"] if show_score else []) + (["WATCH"] if show_watch else [])
+    columns = [("TIME", "time"), ("GAME", "game")]
+    if any(r["score"] for r in rows):
+        columns.append(("SCORE", "score"))
+    if any(r["line"] for r in rows):
+        columns.append(("LINE", "line"))
+    if any(r["total"] for r in rows):
+        columns.append(("O/U", "total"))
+    if show_watch:
+        columns.append(("WATCH", "watch"))
 
-    table = []
-    for when, game, score, watch in rows:
-        cells = [when, game]
-        if show_score:
-            cells.append(score or "-")
-        if show_watch:
-            cells.append(watch or "-")
-        table.append(cells)
-
+    headers = [h for h, _ in columns]
+    table = [[(r[k] or ("-" if k not in ("time", "game") else "")) for _, k in columns] for r in rows]
     widths = [max(len(h), *(len(r[i]) for r in table)) for i, h in enumerate(headers)]
 
     def fmt(cells):
@@ -302,9 +435,13 @@ def main() -> int:
     tz = ZoneInfo(os.environ.get("TIMEZONE", "America/New_York"))
     show_scores = os.environ.get("SHOW_SCORES") == "1"
     show_tv = os.environ.get("SHOW_TV", "1") != "0"
+    show_lines = os.environ.get("SHOW_LINES", "1") != "0"
+    show_totals = show_lines and os.environ.get("SHOW_TOTALS") == "1"
     use_short = os.environ.get("SHORT_NAMES", "1") != "0"
+    book = os.environ.get("BOOKMAKER", "draftkings").strip().lower()
     selected = os.environ.get("LEAGUES")
     keys = [k.strip().lower() for k in selected.split(",")] if selected else list(LEAGUES)
+    need_espn = show_tv or use_short or show_lines  # names/abbreviations/TV
 
     now = datetime.now(tz)
     day_start = datetime.combine(now.date(), time.min, tzinfo=tz)
@@ -320,6 +457,7 @@ def main() -> int:
         return 1
 
     embeds = []
+    any_lines = False
     for key in keys:
         if key not in LEAGUES:
             print(f"Unknown league '{key}', skipping.", file=sys.stderr)
@@ -336,27 +474,47 @@ def main() -> int:
             continue
         if not events:
             continue
-
         events.sort(key=lambda e: e["commence_time"])
-        tv_lookup = fetch_espn_broadcasts(key, espn_dates) if show_tv else {}
-        short = use_short and key in SHORT_NAME_LEAGUES
-        rows = [
-            make_row(
-                e, tz, scores.get(e["id"]),
-                find_broadcast(tv_lookup, e["away_team"], e["home_team"]),
-                short,
-            )
-            for e in events
-        ]
+
+        espn = fetch_espn_info(key, espn_dates) if need_espn else {"games": {}, "teams": {}}
+
+        odds = {}
+        market = LINE_MARKET.get(key, "h2h")
+        if show_lines:
+            wanted = [market] + (["totals"] if show_totals else [])
+            try:
+                odds = fetch_odds(api_key, sport_key, wanted)
+            except requests.RequestException as e:
+                print(f"Could not fetch lines for {name}: {e}", file=sys.stderr)
+
+        rows = []
+        for e in events:
+            away, home = e["away_team"], e["home_team"]
+            away_d = team_display(away, key, espn["teams"], use_short)
+            home_d = team_display(home, key, espn["teams"], use_short)
+            labels = {
+                away: team_abbr(away, espn["teams"], away_d),
+                home: team_abbr(home, espn["teams"], home_d),
+            }
+            line, total = get_lines(odds.get(e["id"]), market, labels, book, show_totals)
+            tv = find_broadcast(espn["games"], away, home) if show_tv else ""
+            rows.append(make_row(e, tz, scores.get(e["id"]), away_d, home_d, line, total, tv))
+
+        any_lines = any_lines or any(r["line"] or r["total"] for r in rows)
         embeds.extend(build_table_embeds(f"{icon} {name}", color, rows, show_watch=show_tv))
 
     if not embeds:
         post_to_discord(webhook_url, f"No games found for {date_label}.", [])
         return 0
 
+    if any_lines:
+        embeds[-1]["footer"] = {"text": "Lines from The Odds API · they move, so check your book"}
+
     header = f"**Today's games** · {date_label} · times in {now.strftime('%Z')}"
     post_to_discord(webhook_url, header, embeds)
     print(f"Posted {len(embeds)} embed(s).")
+    if USAGE:
+        print(f"Odds API credits — last call: {USAGE.get('last')}, remaining: {USAGE.get('remaining')}")
     return 0
 
 
