@@ -1,0 +1,24 @@
+name: Daily Sports Post
+
+on:
+  schedule:
+    - cron: "0 13 * * *"   # 13:00 UTC daily (9 AM Eastern during daylight time)
+  workflow_dispatch:        # adds a manual "Run workflow" button
+
+jobs:
+  post:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install requests
+
+      - run: python daily_sports.py
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          TIMEZONE: America/New_York
+          # LEAGUES: nba,nhl,epl
