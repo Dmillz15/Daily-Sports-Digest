@@ -2,7 +2,7 @@ name: Daily Sports Post
 
 on:
   schedule:
-    - cron: "0 13 * * *"   # 13:00 UTC daily (9 AM Eastern during daylight time)
+    - cron: "0 12 * * *"   # 12:00 UTC daily (8 AM Eastern during daylight time)
   workflow_dispatch:        # adds a manual "Run workflow" button
 
 jobs:
@@ -20,5 +20,5 @@ jobs:
       - run: python daily_sports.py
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          TIMEZONE: America/New_York
+          TIMEZONE: America/Chicago
           # LEAGUES: nba,nhl,epl
