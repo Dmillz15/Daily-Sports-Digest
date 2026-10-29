@@ -25,6 +25,11 @@ Optional env vars:
     ANSI          Set to 1 for COLORED tables (colored/bold headings, green lines,
                   red LIVE tags). Discord shows colors on desktop and web only;
                   on mobile it can look plain or garbled, so it is off by default.
+    TABLE_WIDTH   Max characters per table line (default: 52). Discord wraps
+                  longer lines onto a second line. The script automatically
+                  compacts each table to fit: shorter times (7:10p), then team
+                  abbreviations (CBJ @ CAR), then drops the O/U column. Lower
+                  this (for example 40) if tables wrap on phones.
     BIG_HEADERS   Large markdown headers for the post title and each league
                   (default: on). Set to 0 to use plain embed titles instead.
 
@@ -83,6 +88,34 @@ TWO_WORD_NICKNAMES = (
     "Trail Blazers", "Red Sox", "White Sox", "Blue Jays", "Blue Jackets",
     "Maple Leafs", "Golden Knights", "Red Wings", "Hockey Club",
 )
+
+# Long network names are shortened so the WATCH column stays narrow.
+NETWORK_SHORT = {
+    "NBA League Pass": "NBA LP",
+    "Prime Video": "Prime",
+    "Amazon Prime Video": "Prime",
+    "Apple TV+": "Apple TV",
+    "Paramount+": "Paramount",
+    "NFL Network": "NFL Net",
+    "MLB Network": "MLB Net",
+    "NHL Network": "NHL Net",
+    "CBS Sports Network": "CBSSN",
+    "Big Ten Network": "BTN",
+    "SEC Network": "SECN",
+    "ACC Network": "ACCN",
+    "Fox Sports 1": "FS1",
+    "Fox Sports 2": "FS2",
+    "YouTube TV": "YouTube",
+}
+MAX_WATCH_WIDTH = 9
+
+
+def shorten_network(name: str) -> str:
+    name = NETWORK_SHORT.get(name, name)
+    if len(name) > MAX_WATCH_WIDTH:
+        name = name[:MAX_WATCH_WIDTH - 1].rstrip() + "…"
+    return name
+
 
 # ESPN is used ONLY for short names, abbreviations, and where to watch.
 ESPN_URL = "https://site.api.espn.com/apis/site/v2/sports/{path}/scoreboard"
@@ -349,22 +382,32 @@ def get_lines(odds_event, market: str, labels: dict, preferred: str, want_totals
 
 
 def make_row(event: dict, tz: ZoneInfo, score_event, away_d: str, home_d: str,
-             line: str = "", total: str = "", tv: str = "") -> dict:
+             line: str = "", total: str = "", tv: str = "", game_abbr: str = "") -> dict:
     game = f"{away_d} @ {home_d}"
-    row = {"time": "", "game": game, "score": "", "line": "", "total": "", "watch": ""}
+    row = {
+        "time": "", "time_short": "",
+        "game": game, "game_abbr": game_abbr or game,
+        "score": "", "line": "", "total": "", "watch": "",
+    }
 
     scores = (score_event or {}).get("scores")
     if scores:
         by_team = {s["name"]: s["score"] for s in scores}
         row["score"] = f"{by_team.get(event['away_team'], '0')}–{by_team.get(event['home_team'], '0')}"
         if score_event.get("completed"):
-            row["time"] = "FINAL"
+            row["time"] = row["time_short"] = "FINAL"
         else:
-            row["time"], row["watch"] = "LIVE", tv
+            row["time"] = row["time_short"] = "LIVE"
+            row["watch"] = tv
         return row
 
     start = datetime.fromisoformat(event["commence_time"].replace("Z", "+00:00")).astimezone(tz)
-    row.update(time=start.strftime("%I:%M %p").lstrip("0"), line=line, total=total, watch=tv)
+    clock = start.strftime("%I:%M").lstrip("0")
+    row.update(
+        time=f"{clock} {start.strftime('%p')}",           # 7:10 PM
+        time_short=f"{clock}{'a' if start.hour < 12 else 'p'}",  # 7:10p
+        line=line, total=total, watch=tv,
+    )
     return row
 
 
@@ -379,31 +422,69 @@ def _style(text: str, code, ansi: bool) -> str:
     return f"\u001b[{code}m{text}\u001b[0m" if (ansi and code) else text
 
 
+def _plan_table(rows: list, show_watch: bool, max_width: int) -> tuple:
+    """Pick the roomiest layout whose widest line fits in max_width characters.
+
+    Discord wraps long lines inside a code block, which wrecks the table, so
+    we compact step by step: shorter times, then abbreviations, then drop O/U,
+    and finally truncate the GAME column.
+    """
+    def columns_for(drop_total: bool) -> list:
+        cols = [("TIME", "time"), ("GAME", "game")]
+        if any(r["score"] for r in rows):
+            cols.append(("SCORE", "score"))
+        if any(r["line"] for r in rows):
+            cols.append(("LINE", "line"))
+        if any(r["total"] for r in rows) and not drop_total:
+            cols.append(("O/U", "total"))
+        if show_watch:
+            cols.append(("WATCH", "watch"))
+        return cols
+
+    def value(r: dict, key: str, short_time: bool, abbr: bool) -> str:
+        if key == "time":
+            v = r["time_short"] if short_time else r["time"]
+        elif key == "game":
+            v = r["game_abbr"] if abbr else r["game"]
+        else:
+            v = r[key]
+        return v or ("-" if key not in ("time", "game") else "")
+
+    # (short_time, abbreviations, drop_total)
+    attempts = [(False, False, False), (True, False, False), (True, True, False), (True, True, True)]
+    for short_time, abbr, drop_total in attempts:
+        cols = columns_for(drop_total)
+        headers = [h for h, _ in cols]
+        table = [[value(r, k, short_time, abbr) for _, k in cols] for r in rows]
+        widths = [max(len(h), *(len(row[i]) for row in table)) for i, h in enumerate(headers)]
+        width = sum(widths) + 3 * (len(widths) - 1)
+        if width <= max_width:
+            break
+    else:
+        # Last resort: truncate the GAME column (index 1) with an ellipsis
+        room = max(10, widths[1] - (width - max_width))
+        for row in table:
+            if len(row[1]) > room:
+                row[1] = row[1][:room - 1] + "…"
+        widths[1] = max(len(headers[1]), *(len(row[1]) for row in table))
+
+    return [k for _, k in cols], headers, table, widths
+
+
 def build_table_embeds(title: str, color: int, rows: list, show_watch: bool = True,
-                       ansi: bool = False, big_headers: bool = True) -> list:
+                       ansi: bool = False, big_headers: bool = True,
+                       max_width: int = 52) -> list:
     """Render rows as a grid table inside a code block.
 
     Discord doesn't render Markdown tables, and font size can't change inside a
     code block, so the league title gets a big markdown header above the table
     and the table itself uses box-drawing grid lines (and optional ANSI colors).
-    Columns with no data are left out. Splits into extra embeds if it would
-    exceed Discord's size limit.
+    The layout is auto-compacted so no line exceeds max_width characters (which
+    would wrap). Columns with no data are left out. Splits into extra embeds if
+    it would exceed Discord's size limit.
     """
-    columns = [("TIME", "time"), ("GAME", "game")]
-    if any(r["score"] for r in rows):
-        columns.append(("SCORE", "score"))
-    if any(r["line"] for r in rows):
-        columns.append(("LINE", "line"))
-    if any(r["total"] for r in rows):
-        columns.append(("O/U", "total"))
-    if show_watch:
-        columns.append(("WATCH", "watch"))
-
-    headers = [h for h, _ in columns]
-    keys = [k for _, k in columns]
-    n = len(columns)
-    table = [[(r[k] or ("-" if k not in ("time", "game") else "")) for k in keys] for r in rows]
-    widths = [max(len(h), *(len(r[i]) for r in table)) for i, h in enumerate(headers)]
+    keys, headers, table, widths = _plan_table(rows, show_watch, max_width)
+    n = len(keys)
 
     def cell(i: int, text: str, code) -> str:
         body = text.ljust(widths[i]) if i < n - 1 else text   # last column unpadded
@@ -515,6 +596,10 @@ def main() -> int:
     use_short = os.environ.get("SHORT_NAMES", "1") != "0"
     ansi = os.environ.get("ANSI") == "1"
     big_headers = os.environ.get("BIG_HEADERS", "1") != "0"
+    try:
+        max_width = int(os.environ.get("TABLE_WIDTH", "52"))
+    except ValueError:
+        max_width = 52
     book = os.environ.get("BOOKMAKER", "draftkings").strip().lower()
     selected = os.environ.get("LEAGUES")
     keys = [k.strip().lower() for k in selected.split(",")] if selected else list(LEAGUES)
@@ -574,13 +659,14 @@ def main() -> int:
                 home: team_abbr(home, espn["teams"], home_d),
             }
             line, total = get_lines(odds.get(e["id"]), market, labels, book, show_totals)
-            tv = find_broadcast(espn["games"], away, home) if show_tv else ""
-            rows.append(make_row(e, tz, scores.get(e["id"]), away_d, home_d, line, total, tv))
+            tv = shorten_network(find_broadcast(espn["games"], away, home)) if show_tv else ""
+            game_abbr = f"{labels[away]} @ {labels[home]}"
+            rows.append(make_row(e, tz, scores.get(e["id"]), away_d, home_d, line, total, tv, game_abbr))
 
         any_lines = any_lines or any(r["line"] or r["total"] for r in rows)
         embeds.extend(build_table_embeds(
             f"{icon} {name}", color, rows,
-            show_watch=show_tv, ansi=ansi, big_headers=big_headers,
+            show_watch=show_tv, ansi=ansi, big_headers=big_headers, max_width=max_width,
         ))
 
     if not embeds:
