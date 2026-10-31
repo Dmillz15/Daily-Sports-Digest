@@ -16,6 +16,8 @@ jobs:
           python-version: "3.12"
 
       - run: pip install requests
+      
+      - run: echo "Trigger - ${{ github.event_name }} at $(date -u)"
 
       - run: python daily_sports_oddsapi.py
         env:
