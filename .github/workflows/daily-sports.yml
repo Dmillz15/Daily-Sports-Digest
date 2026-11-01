@@ -2,7 +2,7 @@ name: Daily Sports Post
 
 on:
   schedule:
-    - cron: "47 4 * * *"
+    - cron: "47 4 * * *" # Runs at 04:47 
   workflow_dispatch:        # adds a manual "Run workflow" button
 
 jobs:
