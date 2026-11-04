@@ -23,6 +23,12 @@ Optional env vars:
     SHORT_NAMES   Set to 0 to use full-length team names and times when they
                   fit within TABLE_WIDTH (default: on = always compact).
     SHOW_SCORES   Set to 1 to also fetch live scores (1 credit per league per run).
+    COLLEGE_FILTER  "major" (default) keeps only college football/basketball games
+                  where either team is in the ACC, Big 12, Big Ten, SEC (plus Big
+                  East for basketball, and Notre Dame) or is ranked in the Top 25.
+                  Set to "all" to show every game The Odds API lists.
+    EXTRA_COLLEGE_TEAMS  Comma-separated schools to always include, using ESPN's
+                  school names, e.g. "Boise State,Memphis,Gonzaga".
     ANSI          Set to 1 for COLORED tables (colored/bold headings, green lines,
                   red LIVE tags). Discord shows colors on desktop and web only;
                   on mobile it can look plain or garbled, so it is off by default.
@@ -121,6 +127,40 @@ def shorten_network(name: str) -> str:
         name = name[:MAX_WATCH_WIDTH - 1].rstrip() + "…"
     return name
 
+
+# College filter (COLLEGE_FILTER=major): a game is kept if EITHER team is on these
+# lists (matched against ESPN's school names) or is ranked in the Top 25.
+# Conference membership changes, so edit these lists (or use EXTRA_COLLEGE_TEAMS).
+COLLEGE_LEAGUES = {"ncaaf", "ncaam"}
+POWER_SCHOOLS = [
+    # SEC
+    "Alabama", "Arkansas", "Auburn", "Florida", "Georgia", "Kentucky", "LSU",
+    "Mississippi State", "Missouri", "Oklahoma", "Ole Miss", "South Carolina",
+    "Tennessee", "Texas", "Texas A&M", "Vanderbilt",
+    # Big Ten
+    "Illinois", "Indiana", "Iowa", "Maryland", "Michigan", "Michigan State",
+    "Minnesota", "Nebraska", "Northwestern", "Ohio State", "Oregon", "Penn State",
+    "Purdue", "Rutgers", "UCLA", "USC", "Washington", "Wisconsin",
+    # ACC
+    "Boston College", "California", "Cal", "Clemson", "Duke", "Florida State",
+    "Georgia Tech", "Louisville", "Miami", "Miami (FL)", "NC State",
+    "North Carolina", "Pittsburgh", "Pitt", "SMU", "Stanford", "Syracuse",
+    "Virginia", "Virginia Tech", "Wake Forest",
+    # Big 12
+    "Arizona", "Arizona State", "Baylor", "BYU", "Cincinnati", "Colorado",
+    "Houston", "Iowa State", "Kansas", "Kansas State", "Oklahoma State", "TCU",
+    "Texas Tech", "UCF", "Utah", "West Virginia",
+    # Independent
+    "Notre Dame",
+]
+BIG_EAST_SCHOOLS = [  # added for basketball only
+    "Butler", "Connecticut", "UConn", "Creighton", "DePaul", "Georgetown",
+    "Marquette", "Providence", "Seton Hall", "St. John's", "Villanova", "Xavier",
+]
+COLLEGE_NOTE = {
+    "ncaaf": "ACC · Big 12 · Big Ten · SEC · Notre Dame · Top 25",
+    "ncaam": "ACC · Big 12 · Big East · Big Ten · SEC · Top 25",
+}
 
 # ESPN is used ONLY for short names, abbreviations, and where to watch.
 ESPN_URL = "https://site.api.espn.com/apis/site/v2/sports/{path}/scoreboard"
@@ -282,9 +322,14 @@ def fetch_espn_info(league_key: str, dates: list) -> dict:
                     team = c.get("team") or {}
                     display = team.get("displayName", "")
                     if display:
+                        rank = (c.get("curatedRank") or {}).get("current")
+                        if not isinstance(rank, int):
+                            rank = c.get("rank") if isinstance(c.get("rank"), int) else None
                         info["teams"][normalize(display)] = {
                             "short": team.get("shortDisplayName") or "",
                             "abbr": team.get("abbreviation") or "",
+                            "location": team.get("location") or "",
+                            "rank": rank,
                         }
                     names[c.get("homeAway")] = normalize(display)
                 tv = get_main_broadcast(comp)
@@ -303,6 +348,27 @@ def find_team(teams: dict, name: str):
         if k and n and (k in n or n in k):
             return v
     return None
+
+
+def college_schools(key: str, extras: list) -> set:
+    """Normalized school names that count as 'major' for this league."""
+    names = list(POWER_SCHOOLS) + (BIG_EAST_SCHOOLS if key == "ncaam" else []) + list(extras)
+    return {normalize(n) for n in names if n}
+
+
+def is_major_game(event: dict, teams: dict, schools: set) -> bool:
+    """True if either team is a listed school or ranked in the Top 25."""
+    for name in (event["away_team"], event["home_team"]):
+        info = find_team(teams, name)
+        if not info:
+            continue  # e.g. an FCS or small school ESPN's list doesn't include
+        rank = info.get("rank")
+        if isinstance(rank, int) and 1 <= rank <= 25:
+            return True
+        for field in ("short", "location"):
+            if info.get(field) and normalize(info[field]) in schools:
+                return True
+    return False
 
 
 def find_broadcast(games: dict, away_team: str, home_team: str) -> str:
@@ -493,7 +559,7 @@ def _plan_table(rows: list, show_watch: bool, max_width: int, prefer_compact: bo
 def build_table_embeds(title: str, color: int, rows: list, show_watch: bool = True,
                        ansi: bool = False, big_headers: bool = True,
                        max_width: int = 40, prefer_compact: bool = True,
-                       grid: str = "ascii") -> list:
+                       grid: str = "ascii", subtitle: str = "") -> list:
     """Render rows as a grid table inside a code block.
 
     Discord doesn't render Markdown tables, and font size can't change inside a
@@ -539,7 +605,9 @@ def build_table_embeds(title: str, color: int, rows: list, show_watch: bool = Tr
     lines = [render(r) for r in table]
 
     lang = "ansi" if ansi else ""
-    header_room = len(f"## {title} (cont.)") + 1 if big_headers else 0
+    header_room = len(subtitle) + 1
+    if big_headers:
+        header_room += len(f"## {title} (cont.)") + 1 + (3 if subtitle else 0)
     overhead = header_room + len(f"```{lang}\n") + len(head) + 1 + len(divider) + 1 + len("```")
     chunks, current, size = [], [], overhead
     for line in lines:
@@ -557,10 +625,11 @@ def build_table_embeds(title: str, color: int, rows: list, show_watch: bool = Tr
         body = f"```{lang}\n{head}\n{divider}\n" + "\n".join(chunk) + "\n```"
         embed = {"color": color}
         if big_headers:
-            embed["description"] = f"## {name}\n{body}"
+            sub_line = f"-# {subtitle}\n" if subtitle else ""
+            embed["description"] = f"## {name}\n{sub_line}{body}"
         else:
             embed["title"] = name
-            embed["description"] = body
+            embed["description"] = (f"{subtitle}\n" if subtitle else "") + body
         embeds.append(embed)
     return embeds
 
@@ -625,7 +694,10 @@ def main() -> int:
     book = os.environ.get("BOOKMAKER", "draftkings").strip().lower()
     selected = os.environ.get("LEAGUES")
     keys = [k.strip().lower() for k in selected.split(",")] if selected else list(LEAGUES)
-    need_espn = show_tv or use_short or show_lines  # names/abbreviations/TV
+    college_filter = os.environ.get("COLLEGE_FILTER", "major").strip().lower()
+    extra_college = [t.strip() for t in os.environ.get("EXTRA_COLLEGE_TEAMS", "").split(",") if t.strip()]
+    # ESPN data supplies names/abbreviations/TV and the college filter
+    need_espn = show_tv or use_short or show_lines or college_filter == "major"
 
     now = datetime.now(tz)
     day_start = datetime.combine(now.date(), time.min, tzinfo=tz)
@@ -662,6 +734,17 @@ def main() -> int:
 
         espn = fetch_espn_info(key, espn_dates) if need_espn else {"games": {}, "teams": {}}
 
+        note = ""
+        if college_filter == "major" and key in COLLEGE_LEAGUES and espn["teams"]:
+            # (If ESPN couldn't be reached, espn["teams"] is empty and we show everything.)
+            before = len(events)
+            schools = college_schools(key, extra_college)
+            events = [e for e in events if is_major_game(e, espn["teams"], schools)]
+            note = COLLEGE_NOTE[key]
+            print(f"{name}: showing {len(events)} of {before} games (major conferences + Top 25)")
+            if not events:
+                continue
+
         odds = {}
         market = LINE_MARKET.get(key, "h2h")
         if show_lines:
@@ -689,7 +772,7 @@ def main() -> int:
         embeds.extend(build_table_embeds(
             f"{icon} {name}", color, rows,
             show_watch=show_tv, ansi=ansi, big_headers=big_headers, max_width=max_width,
-            prefer_compact=use_short, grid=grid,
+            prefer_compact=use_short, grid=grid, subtitle=note,
         ))
 
     if not embeds:
