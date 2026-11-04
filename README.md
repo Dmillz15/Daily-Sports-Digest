@@ -40,6 +40,7 @@ Each league gets its own colored section with a large heading. Leagues with no g
 ## Features
 
 - **Ten leagues out of the box:** NBA, NFL, MLB, NHL, WNBA, college football, men's college basketball, Premier League, MLS, and Champions League
+- **College sports without the clutter:** by default, college football and basketball show only games with a team from a major conference (ACC, Big 12, Big Ten, SEC, plus Big East for basketball, and Notre Dame) or a ranked team
 - **Betting lines** pulled from a sportsbook of your choice (DraftKings by default)
 - **One "where to watch" network per game,** favoring the national broadcaster
 - **Built for phones:** tables are compact and auto-fit to a maximum width so lines don't wrap on mobile
@@ -136,6 +137,8 @@ All settings are optional environment variables. In GitHub Actions, add them to 
 | `BOOKMAKER` | `draftkings` | Preferred sportsbook key, e.g. `fanduel`. Falls back to any book that has a line |
 | `SHOW_TV` | `1` | Set to `0` to remove the WATCH column |
 | `SHOW_SCORES` | `0` | Set to `1` to add live/final scores |
+| `COLLEGE_FILTER` | `major` | `major` keeps only college games with a major-conference or Top 25 team. Set to `all` to show every game |
+| `EXTRA_COLLEGE_TEAMS` | none | Schools to always include, comma-separated, e.g. `Boise State,Memphis,Gonzaga` |
 | `SHORT_NAMES` | `1` | Set to `0` to use full names and times when they fit |
 | `TABLE_WIDTH` | `40` | Max characters per table line. Lower it (e.g. `36`) if tables wrap on phones |
 | `GRID` | `ascii` | `ascii` works everywhere; `box` uses prettier line characters that some phones draw unevenly |
@@ -158,6 +161,15 @@ All settings are optional environment variables. In GitHub Actions, add them to 
 | `ucl` | Champions League |
 
 To add another league, add a line to the `LEAGUES` and `ESPN_PATHS` settings near the top of the script.
+
+### College filter
+
+College football and men's basketball would otherwise list every game sportsbooks offer lines on, which can be dozens of games between smaller schools. With the default `COLLEGE_FILTER=major`, a game is shown if **either team**:
+
+- is in the **ACC, Big 12, Big Ten, or SEC** (plus **Big East** for basketball), or is **Notre Dame**, or
+- is ranked in the **AP Top 25**
+
+Each college table notes which filter is active. To add a school that isn't covered (like Boise State), use `EXTRA_COLLEGE_TEAMS`. Conference membership changes over time, so the school lists near the top of the script (`POWER_SCHOOLS` and `BIG_EAST_SCHOOLS`) are easy to edit. Filtering doesn't change your Odds API credit usage.
 
 ## Running it on your own computer
 
@@ -202,6 +214,7 @@ With the default settings on a typical day (4 to 6 leagues in season), that is r
 | Nothing posted | Open the **Actions** tab and read the log for the failed run. Confirm both secrets are set |
 | "No games found" message | Your selected leagues may be out of season or have no games today |
 | Tables wrap on phones | Lower `TABLE_WIDTH` to `36` |
+| A college game I expected is missing | Only major-conference and Top 25 games are shown by default. Add schools with `EXTRA_COLLEGE_TEAMS`, or set `COLLEGE_FILTER=all` |
 | Weird characters instead of colors | `ANSI` colors don't display on mobile. Remove `ANSI` or set it to `0` |
 | Some games have no TV listed | ESPN may not have broadcast info yet, or the game couldn't be matched. This usually fills in later in the day |
 
